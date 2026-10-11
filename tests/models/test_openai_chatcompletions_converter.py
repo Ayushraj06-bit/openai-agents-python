@@ -492,6 +492,69 @@ def test_items_to_messages_merges_refusal_into_pending_tool_call_message():
     assert assistant.get("tool_calls")
 
 
+def test_items_to_messages_merges_every_message_of_a_tool_turn():
+    """A tool turn with two messages between its function call and the call's
+    output must still convert to one assistant message followed directly by the
+    tool message."""
+    func_item, first_msg, func_output = _turn_items_function_call_first()
+    second_msg = cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="43",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputText(text="One moment.", type="output_text", annotations=[])],
+        ).model_dump(),
+    )
+    messages = Converter.items_to_messages([func_item, first_msg, second_msg, func_output])
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "Let me calculate.\nOne moment."
+    tool_calls = assistant.get("tool_calls")
+    assert isinstance(tool_calls, list)
+    assert len(tool_calls) == 1
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "abc"
+
+
+def test_items_to_messages_merges_text_after_refusal_into_tool_call_message():
+    """A text message that follows a refusal in the same tool turn merges into
+    the assistant message that already carries the refusal and the tool calls."""
+    func_item, _, func_output = _turn_items_function_call_first()
+    refusal_msg = cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="42",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputRefusal(refusal="won't do that", type="refusal")],
+        ).model_dump(),
+    )
+    text_msg = cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="43",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputText(text="One moment.", type="output_text", annotations=[])],
+        ).model_dump(),
+    )
+    messages = Converter.items_to_messages([func_item, refusal_msg, text_msg, func_output])
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    assert assistant["refusal"] == "won't do that"
+    assert assistant["content"] == "One moment."
+    assert assistant.get("tool_calls")
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "abc"
+
+
 def test_items_to_messages_accepts_statusless_output_message():
     """Output messages remain recognizable after replay normalization removes null status."""
     statusless_message = cast(

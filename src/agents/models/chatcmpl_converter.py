@@ -759,7 +759,8 @@ class Converter:
                 # and the pending assistant message then already carries the tool calls
                 # of this same turn: a function_call_output always flushes, so tool calls
                 # from a previous turn cannot still be pending here. Merge the message
-                # into that pending assistant message. Flushing instead would emit an
+                # into that pending assistant message, including when an earlier message
+                # of the same turn was already merged. Flushing instead would emit an
                 # assistant message with tool_calls directly followed by another
                 # assistant message, a sequence the Chat Completions API rejects.
                 pending_content = (
@@ -770,10 +771,10 @@ class Converter:
                 if (
                     current_assistant_msg is not None
                     and current_assistant_msg.get("tool_calls")
-                    and "refusal" not in current_assistant_msg
-                    # None is the untouched state; a list means thinking blocks were
-                    # already reconstructed into content parts and text can be appended.
-                    and (pending_content is None or isinstance(pending_content, list))
+                    # None is the untouched state, a str is text from an earlier message of
+                    # this turn, and a list means thinking blocks were already reconstructed
+                    # into content parts. Text can be appended in each case.
+                    and (pending_content is None or isinstance(pending_content, (str, list)))
                 ):
                     merged_asst = current_assistant_msg
                     if text_segments:
@@ -783,6 +784,8 @@ class Converter:
                                 *pending_content,
                                 ChatCompletionContentPartTextParam(text=combined, type="text"),
                             ]
+                        elif isinstance(pending_content, str):
+                            merged_asst["content"] = f"{pending_content}\n{combined}"
                         else:
                             merged_asst["content"] = combined
                     if refusal is not None:
