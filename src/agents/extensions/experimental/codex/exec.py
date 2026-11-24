@@ -5,6 +5,7 @@ import contextlib
 import os
 import platform
 import shutil
+import subprocess
 import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ _SUBPROCESS_STREAM_LIMIT_ENV_VAR = "OPENAI_AGENTS_CODEX_SUBPROCESS_STREAM_LIMIT_
 _DEFAULT_SUBPROCESS_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
 _MIN_SUBPROCESS_STREAM_LIMIT_BYTES = 64 * 1024
 _MAX_SUBPROCESS_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
+_TASKKILL_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,7 @@ class CodexExec:
                 if args.signal is not None:
                     args.signal.set()
                 if process.returncode is None:
+                    _kill_windows_process_tree(process)
                     process.terminate()
 
                 raise RuntimeError(f"Codex stream idle for {args.idle_timeout_seconds} seconds.")
@@ -212,6 +215,7 @@ class CodexExec:
             if cancel_task is not None and not cancel_task.done():
                 cancel_task.cancel()
             if process.returncode is None:
+                _kill_windows_process_tree(process)
                 process.kill()
             try:
                 while await stdout.read(1024):
@@ -245,7 +249,27 @@ class CodexExec:
 async def _watch_signal(signal: asyncio.Event, process: asyncio.subprocess.Process) -> None:
     await signal.wait()
     if process.returncode is None:
+        _kill_windows_process_tree(process)
         process.terminate()
+
+
+def _kill_windows_process_tree(process: asyncio.subprocess.Process) -> None:
+    # Windows does not stop descendants, and npm installs Codex as a `codex.cmd` launcher, so
+    # stopping only the direct child would leave Codex running with the stdout pipe open.
+    if sys.platform != "win32":
+        return
+
+    # Use an absolute path because Windows searches the working directory before System32.
+    taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+    # Block so that asyncio cannot reap the process and release its PID before taskkill resolves it.
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            [taskkill, "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_TASKKILL_TIMEOUT_SECONDS,
+        )
 
 
 def _platform_target_triple() -> str:

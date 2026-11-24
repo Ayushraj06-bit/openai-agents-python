@@ -5,8 +5,10 @@ import importlib
 import inspect
 import json
 import os
+import subprocess
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -29,6 +31,19 @@ thread_module = importlib.import_module("agents.extensions.experimental.codex.th
 output_schema_module = importlib.import_module(
     "agents.extensions.experimental.codex.output_schema_file"
 )
+
+
+@pytest.fixture(autouse=True)
+def taskkill_commands(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    # Keep the PIDs of fake processes away from the real taskkill on Windows.
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(exec_module.subprocess, "run", fake_run)
+    return commands
 
 
 class FakeStdin:
@@ -86,6 +101,7 @@ class FakeProcess:
         self.stdout = FakeStdout(stdout_lines) if stdout_present else None
         self.stderr = FakeStderr(stderr_chunks or []) if stderr_present else None
         self.returncode = returncode
+        self.pid = 4242
         self.killed = False
         self.terminated = False
 
@@ -462,6 +478,7 @@ async def test_codex_exec_run_drains_stdout_before_waiting_for_live_process(
             self.stdout = BackpressuredStdout()
             self.stderr = BlockingStderr()
             self.returncode: int | None = None
+            self.pid = 4242
             self.killed = False
             self.wait_called = False
 
@@ -526,6 +543,7 @@ async def test_codex_exec_run_cancels_pending_timeout_read_before_draining_stdou
             self.stdout = BlockingStdout()
             self.stderr = FakeStderr([])
             self.returncode: int | None = None
+            self.pid = 4242
             self.killed = False
 
         async def wait(self) -> None:
@@ -689,6 +707,124 @@ async def test_watch_signal_terminates_process() -> None:
     await task
 
     assert process.terminated is True
+
+
+class RunningProcess(FakeProcess):
+    """A fake whose stdout stays open after one line until the process is stopped."""
+
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(stdout_lines=[], returncode=None)
+        self.calls = calls
+        self._stopped = asyncio.Event()
+        self._line_read = False
+        self.stdout = cast(Any, self)
+
+    async def readline(self) -> bytes:
+        if not self._line_read:
+            self._line_read = True
+            return b"line\n"
+        await self._stopped.wait()
+        return b""
+
+    async def read(self, _size: int) -> bytes:
+        await self._stopped.wait()
+        return b""
+
+    def _stop(self, call: str) -> None:
+        self.calls.append(call)
+        self.returncode = 1
+        self._stopped.set()
+
+    def kill(self) -> None:
+        self._stop("kill")
+
+    def terminate(self) -> None:
+        self._stop("terminate")
+
+
+async def _stop_running_process(
+    monkeypatch: pytest.MonkeyPatch, calls: list[str], stop: str
+) -> None:
+    process = RunningProcess(calls)
+
+    async def fake_create_subprocess_exec(*_args: Any, **_kwargs: Any) -> RunningProcess:
+        return process
+
+    monkeypatch.setattr(exec_module.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    signal = asyncio.Event() if stop == "signal" else None
+    stream = exec_module.CodexExec(executable_path="codex").run(
+        exec_module.CodexExecArgs(
+            input="hello",
+            signal=signal,
+            idle_timeout_seconds=0.01 if stop == "idle-timeout" else None,
+        )
+    )
+    assert await anext(stream) == "line"
+    if stop == "aclose":
+        await asyncio.wait_for(stream.aclose(), timeout=5)
+        return
+    if signal is not None:
+        signal.set()
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(anext(stream), timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "taskkill_error",
+    [
+        pytest.param(None, id="succeeds"),
+        pytest.param(FileNotFoundError("taskkill"), id="missing"),
+        pytest.param(subprocess.TimeoutExpired("taskkill", 5), id="times-out"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stop", "expected"),
+    [("signal", "terminate"), ("idle-timeout", "terminate"), ("aclose", "kill")],
+)
+async def test_codex_exec_run_kills_windows_process_tree_before_process(
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+    expected: str,
+    taskkill_error: Exception | None,
+) -> None:
+    calls: list[str] = []
+    commands: list[list[str]] = []
+    timeouts: list[float | None] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> None:
+        calls.append("taskkill")
+        commands.append(command)
+        timeouts.append(kwargs.get("timeout"))
+        if taskkill_error is not None:
+            raise taskkill_error
+
+    monkeypatch.setattr(exec_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(exec_module, "sys", SimpleNamespace(platform="win32"))
+
+    await _stop_running_process(monkeypatch, calls, stop)
+
+    assert calls == ["taskkill", expected]
+    assert commands[0][0].endswith(os.path.join("System32", "taskkill.exe"))
+    assert commands[0][1:] == ["/PID", "4242", "/T", "/F"]
+    assert timeouts[0] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "expected"),
+    [("signal", "terminate"), ("idle-timeout", "terminate"), ("aclose", "kill")],
+)
+async def test_codex_exec_run_does_not_use_taskkill_off_windows(
+    monkeypatch: pytest.MonkeyPatch, taskkill_commands: list[list[str]], stop: str, expected: str
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(exec_module, "sys", SimpleNamespace(platform="linux"))
+
+    await _stop_running_process(monkeypatch, calls, stop)
+
+    assert calls == [expected]
+    assert taskkill_commands == []
 
 
 @pytest.mark.parametrize(
